@@ -50,6 +50,8 @@ from sklearn.preprocessing import StandardScaler
 from sudachipy import dictionary
 from sudachipy import tokenizer
 import time
+from train_and_evaluate import LSTM  # LSTMモデルをインポート
+from collections import deque
 
 app = Flask(__name__)
 
@@ -366,20 +368,29 @@ def compute_optimal_clusters(data, max_clusters: int = 6) -> int:
 
 
 # ------------------------------------------------------------
-#  1) 追加オーディオ特徴量（計算専用）
-#     ・key_sin, key_cos  … 円周エンコード
-#     ・loudness_rel      … 音圧中央値からの差分
-#
-# 2) "元の列" (key, loudness) は
-#    - 計算用 DataFrame では **drop**
-#    - 表示用 DataFrame では **そのまま残す**
+#  共通の特徴量エンジニアリング
 # ------------------------------------------------------------
-def add_audio_features_and_trim(df: pd.DataFrame) -> None:
-    """計算用 DF に追加列を作成し、key と loudness を削除（in-place）"""
-    df["key_sin"] = np.sin(2 * np.pi * df["key"] / 12)
-    df["key_cos"] = np.cos(2 * np.pi * df["key"] / 12)
-    df["loudness_rel"] = df["loudness"] - df["loudness"].median()
-    df.drop(columns=["key", "loudness"], inplace=True)
+def process_audio_features(df: pd.DataFrame, is_display: bool = False) -> pd.DataFrame:
+    """
+    音声特徴量の前処理を行う
+    
+    Args:
+        df: 入力DataFrame
+        is_display: 表示用の場合はTrue（元の列を保持）
+    
+    Returns:
+        処理済みのDataFrame
+    """
+    processed_df = df.copy()
+    
+    # 計算用の特徴量を追加（表示用では使用しない）
+    if not is_display:
+        processed_df["key_sin"] = np.sin(2 * np.pi * processed_df["key"] / 12)
+        processed_df["key_cos"] = np.cos(2 * np.pi * processed_df["key"] / 12)
+        processed_df["loudness_rel"] = processed_df["loudness"] - processed_df["loudness"].median()
+        processed_df.drop(columns=["key", "loudness"], inplace=True)
+    
+    return processed_df
 
 
 # ==========================
@@ -439,15 +450,11 @@ def cluster_search():
         return pd.DataFrame(), [], []
 
     # ---------- ① 計算用 / ② 表示用 に複製 ----------
-    calc_df = base_df.copy()
-    disp_df = base_df.copy()   # ← 列はいじらない
-
-    # ----- 計算用 DF: 追加特徴量を入れて key/loudness を drop -----
-    add_audio_features_and_trim(calc_df)
+    calc_df = process_audio_features(base_df, is_display=False)
+    disp_df = process_audio_features(base_df, is_display=True)
 
     # ----- 楽曲カタログ側も計算仕様を合わせる -----
-    dfe_calc = dfe.copy()
-    add_audio_features_and_trim(dfe_calc)
+    dfe_calc = process_audio_features(dfe, is_display=False)
 
     # ---------- スケーリング ----------
     scaler = StandardScaler()
@@ -568,115 +575,207 @@ from collections import deque
 import torch, torch.nn as nn
 import numpy as np
 import faiss
+import pickle
 
 # --- データと設定 ---
-# 外部で定義済み:
-#   vecs_array: np.ndarray (N, d)
-#   df        : pd.DataFrame with at least '曲名', 'artist' columns
 window_size = 10
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# --- 埋め込み & 曲DB 辞書 ---
-# 'audio' を常に 'dummy_audio.wav' で設定
-track_embeddings = {i: vecs_array[i].astype('float32') for i in range(len(vecs_array))}
-track_db = {
-    i: {
-        'id': i,
-        'name': df.loc[i, '曲名'],
-        'artist': df.loc[i, 'artist'],
-        'audio': 'dummy_audio.wav'
-    }
-    for i in track_embeddings
-}
+# --- モデルとスケーラーの読み込み ---
+def load_model_and_scaler():
+    # スケーラーの読み込み
+    with open('scaler.pkl', 'rb') as f:
+        scaler = pickle.load(f)
+    
+    # モデルの読み込み
+    model = LSTM(dim=len(scaler.get_feature_names_out())).to(device)
+    model.load_state_dict(torch.load('lstm_model.pth', map_location=device))
+    model.eval()
+    
+    return model, scaler
 
-# --- フォールバック推奨 ---
-def fallback(n):
-    recs = []
-    for j in range(min(n, len(track_db))):
-        info = track_db[j]
-        recs.append((
-            info['name'],
-            info['artist'],
-            j,
-            info['audio']  # ファイル名のみ
-        ))
-    return recs
-
-# --- 履歴バッファ & Faiss インデックス ---
+# --- 履歴の管理 ---
 history = deque(maxlen=window_size)
-d = vecs_array.shape[1]
-index = faiss.IndexFlatL2(d)
-ids = list(track_embeddings.keys())
-all_emb = np.stack([track_embeddings[i] for i in ids]).astype('float32')
-index.add(all_emb)
 
-# --- モデル定義 ---
-class RNN(nn.Module):
-    def __init__(self, dim, h=128, layers=1, drop=0.1):
-        super().__init__()
-        self.lstm = nn.LSTM(dim, h, layers, batch_first=True, dropout=drop)
-        self.fc   = nn.Linear(h, dim)
-
-    def forward(self, x):
-        h0 = x.new_zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size)
-        c0 = h0.clone()
-        y, _ = self.lstm(x, (h0, c0))
-        return self.fc(y[:, -1])
-
-# --- モデル & オプティマイザ 初期化 ---
-model = RNN(d).to(device)
-opt   = torch.optim.SGD(model.fc.parameters(), lr=1e-3)
-# 必要ならモデル重みをロード
-# model.load_state_dict(torch.load('model.pth', map_location=device))
-model.eval()
-model.fc.eval()
+# 履歴ファイルから履歴を読み込む
+def load_history():
+    global history
+    try:
+        with open(HISTORY_FILE, 'r', newline='') as file:
+            reader = csv.reader(file)
+            history_rows = list(reader)
+            if len(history_rows) >= window_size:
+                # 最新のwindow_size件の履歴を読み込む
+                for row in history_rows[-window_size:]:
+                    # タイムスタンプと特徴量を取得
+                    timestamp = pd.to_datetime(row[0])
+                    features = [float(x) for x in row[1:]]
+                    # 特徴量をDataFrameに変換
+                    features_df = pd.DataFrame([features], columns=dfe.columns)
+                    # 時間特徴量を追加
+                    features_df['hour'] = timestamp.hour
+                    features_df['day_of_week'] = timestamp.weekday()
+                    # 前処理を適用
+                    processed_features = process_audio_features(features_df, is_display=False)
+                    history.append(processed_features.values[0])
+    except FileNotFoundError:
+        print("履歴ファイルが見つかりません")
+        history.clear()
 
 # --- 再生時の部分微調整 ---
-def on_play(model, opt, tid):
-    history.append(track_embeddings[tid])
+def on_play(track_features):
+    """
+    曲が再生されたときに呼び出される関数
+    新しい曲の特徴量でモデルを微調整する
+    
+    Args:
+        track_features: 再生された曲の特徴量
+    """
+    global model, history
+    
+    # モデルとスケーラーを読み込み
+    model, scaler = load_model_and_scaler()
+    
+    # 現在時刻を取得
+    current_time = pd.Timestamp.now()
+    
+    # 特徴量をDataFrameに変換
+    features_df = pd.DataFrame([track_features], columns=dfe.columns)
+    # 時間特徴量を追加
+    features_df['hour'] = current_time.hour
+    features_df['day_of_week'] = current_time.weekday()
+    # 前処理を適用
+    processed_features = process_audio_features(features_df, is_display=False)
+    
+    # 特徴量を正規化
+    normalized_features = scaler.transform(processed_features)
+    
+    # 履歴に追加
+    history.append(normalized_features[0])
+    
     if len(history) < window_size:
         return
-    x = torch.tensor([history], device=device)
-    y = torch.tensor([track_embeddings[tid]], device=device)
-    # LSTM を凍結し fc のみ更新
-    model.eval()
-    for p in model.lstm.parameters(): p.requires_grad = False
-    model.fc.train()
-    opt.zero_grad()
-    loss = nn.functional.mse_loss(model(x), y)
+    
+    # 学習モードに切り替え
+    model.train()
+    
+    # 最適化器の設定
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    # 入力データの準備
+    x = torch.tensor([list(history)], device=device, dtype=torch.float32)
+    y = torch.tensor([normalized_features[0]], device=device, dtype=torch.float32)
+    
+    # 勾配の計算と更新
+    optimizer.zero_grad()
+    output = model(x)
+    loss = nn.functional.mse_loss(output, y)
     loss.backward()
-    opt.step()
-    model.fc.eval()
+    optimizer.step()
+    
+    # モデルを保存
+    torch.save(model.state_dict(), 'lstm_model.pth')
+    
+    # 評価モードに戻す
+    model.eval()
 
 # --- 推論: 各ステップ最適曲を1曲ずつ ---
-def predict(model, steps=10):
+def predict_next_songs(num_predictions=10):
+    """
+    次のnum_predictions曲を予測する
+    
+    Args:
+        num_predictions: 予測する曲の数
+    
+    Returns:
+        予測された曲の特徴量のリスト（時間特徴量を含む）と比較用特徴量（時間特徴量を除外）
+    """
+    global model, history
+    
     if len(history) < window_size:
-        return fallback(steps)
-    buf = deque(history, maxlen=window_size)
-    recs = []
-    model.eval()
+        return [], []
+    
+    # モデルとスケーラーを読み込み
+    model, scaler = load_model_and_scaler()
+    
+    predictions = []
+    # 履歴をnumpy配列に変換してからfloat32型のテンソルに変換
+    history_array = np.array(list(history), dtype=np.float32)
+    current_sequence = torch.tensor(history_array, device=device).unsqueeze(0)
+    
     with torch.no_grad():
-        for _ in range(steps):
-            x = torch.tensor([buf], device=device)
-            v = model(x).cpu().numpy().astype('float32')
-            _, I = index.search(v, 1)
-            sid = ids[I[0][0]]
-            info = track_db[sid]
-            recs.append((
-                info['name'],
-                info['artist'],
-                sid,
-                info['audio']  # ファイル名のみ
-            ))
-            buf.append(track_embeddings[sid])
-    return recs
+        for _ in range(num_predictions):
+            # 予測
+            pred = model(current_sequence)
+            predictions.append(pred[0].cpu().numpy())
+            
+            # シーケンスを更新
+            current_sequence = torch.cat([
+                current_sequence[:, 1:],
+                pred.unsqueeze(1)
+            ], dim=1)
+    
+    # 予測結果をDataFrameに変換
+    pred_df = pd.DataFrame(predictions, columns=scaler.get_feature_names_out())
+    
+    # 現在時刻を取得して時間特徴量を更新
+    current_time = pd.Timestamp.now()
+    pred_df['hour'] = current_time.hour
+    pred_df['day_of_week'] = current_time.weekday()
+    
+    # 予測用の特徴量（時間特徴量を含む）
+    prediction_features = pred_df.values
+    
+    # 曲データベースとの比較用の特徴量（時間特徴量を除外）
+    comparison_features = pred_df.drop(columns=['hour', 'day_of_week']).values
+    
+    return prediction_features, comparison_features
+
+# --- 初期化 ---
+model, scaler = load_model_and_scaler()
 
 @app.route('/timeseries')
 def timeseries():
-    recs = predict(model, window_size)
-    if not recs:
+    # 履歴が不足している場合は履歴を再読み込み
+    if len(history) < window_size:
+        load_history()
+    
+    pred_features, comp_features = predict_next_songs(window_size)
+    if len(pred_features) == 0:
         return render_template('timeseries.html', message='履歴が不足しています')
-    return render_template('timeseries.html', recommendations=recs)
+    
+    # dfeの値を前処理
+    dfe_processed = process_audio_features(pd.DataFrame(dfe.values, columns=dfe.columns), is_display=False)
+    
+    # 予測結果を曲情報に変換
+    recommendations = []
+    used_indices = set()  # 既に使用した曲のインデックスを記録
+    
+    for comp_feature in comp_features:
+        # 予測された特徴量と最も類似する曲を検索
+        similarities = cosine_similarity([comp_feature], dfe_processed.values)[0]
+        
+        # 類似度の高い順にインデックスを取得
+        sorted_indices = np.argsort(similarities)[::-1]
+        
+        # まだ使用していない曲を探す
+        selected_idx = None
+        for idx in sorted_indices:
+            if idx not in used_indices:
+                selected_idx = idx
+                used_indices.add(idx)
+                break
+        
+        if selected_idx is not None:
+            # 曲情報を追加
+            recommendations.append((
+                df.iloc[selected_idx]['曲名'],
+                df.iloc[selected_idx]['artist'],
+                selected_idx,
+                'dummy_audio.wav'
+            ))
+    
+    return render_template('timeseries.html', recommendations=recommendations)
 
 if __name__ == '__main__':
     app.run(debug=True)
