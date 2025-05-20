@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ link_name }}</title>
+    <style>
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+        }
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+        li {
+            margin: 20px 0;
+        }
+        .audio-container {
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            width: 100%;
+            max-width: 600px; /* ここで幅を制限しています */
+            margin: 0 auto;
+        }
+        audio {
+            flex-shrink: 0;
+        }
+        .snippet {
+            margin-left: 10px;
+        }
+    </style>
+    <script>
+        function saveHistory(songIndex) {
+            fetch(`/save_history/${songIndex}`, { method: 'POST' })
+                .then(response => response.json())
+                .then(data => console.log(data))
+                .catch(error => console.error('Error:', error));
+        }
+    </script>
+</head>
+<body>
+    <h1>{{ link_name }}</h1>
+    <button onclick="location.href='{{ url_for('index') }}'">ホーム</button>
+    <ul>
+        {% for title, artists, index, audio_file in similarities %}
+            <li>
+                <a href="/song/{{ index }}">{{ title }} / {{artists}}</a>
+                <div class="audio-container">
+                    <audio controls onplay="saveHistory({{ index }})">
+                        <source src="{{ url_for('static', filename=audio_file) }}" type="audio/wav">
+                        お使いのブラウザはaudio要素をサポートしていません。
+                    </audio>
+                </div>
+            </li>
+        {% endfor %}
+    </ul>
+    <a href="/">ホームに戻る</a>
+</body>
+</html>

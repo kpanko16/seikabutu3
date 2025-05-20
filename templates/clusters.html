@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>分析結果</title>
+    <style>
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+            margin: 0;
+            padding: 0;
+        }
+        table {
+            border-collapse: collapse;
+            width: 80%; /* 幅を80%に制限 */
+            max-width: 600px; /* 最大幅を800pxに制限 */
+            margin: 0 auto; /* 中央揃えにします */
+        }
+        th, td {
+            border: 1px solid black;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+    </style>
+</head>
+<body>
+    <h1>分析結果</h1>
+    <button onclick="location.href='{{ url_for('index') }}'">ホーム</button>
+    {% if message %}
+        <p>{{ message }}</p>
+    {% else %}
+        {% set additional_texts = {
+            'length': '曲の長さ',
+            'key': '音階',
+            'mode': '主音 1:メジャー 0:マイナー',
+            'danceability': 'ノリ',
+            'acousticness': 'アコースティック',
+            'energy': 'エネルギッシュ',
+            'instrumentalness': '演奏のみ',
+            'liveness': 'ライブ感',
+            'loudness': '音の大きさ',
+            'speechiness': '話し言葉の多さ',
+            'tempo': 'テンポ',
+            'time_signature': '1小節の拍数',
+            'valence': '陽性感情',
+            'Joy': '喜び（以下は歌詞について）',
+            'Sadness': '悲しみ',
+            'Anticipation': '期待',
+            'Surprise': '驚き',
+            'Anger': '怒り',
+            'Fear': '恐れ',
+            'Disgust': '嫌悪',
+            'Trust': '信頼',
+            'words': '単語の種類',
+        } %}
+        <table>
+            <thead>
+                <tr>
+                    <th> </th><!-- テーブルヘッダー(列) -->
+                    {% for i in range(cluster_means.shape[0]) %}<!-- クラスタ数 -->
+                        <th><a href="{{ url_for('cluster_n', cluster_id=i) }}">旋律の環 {{ i + 1 }}</a></th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for column_name in column_names %}
+                    <tr>
+                        <td>{{ column_name }} : {{ additional_texts[column_name] }}</td>
+                        {% for i in range(cluster_means.shape[0]) %}
+                            {% set value = cluster_means.iloc[i][column_name] %}
+                            {% if column_name == 'length' %}
+                                <td>{{ "%.2f" | format(value) }}秒</td>
+                            {% elif column_name in ['key', 'mode', 'time_signature'] %}
+                                <td>{{ "%.0f" | format(value) }}</td>
+                            {% elif "%.2f"|format(value) == "0.00" %}
+                                <td>{{ "%.7f" | format(value) }}</td>
+                            {% else %}
+                                <td>{{ "%.2f" | format(value) }}</td>
+                            {% endif %}
+                        {% endfor %}
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+    <a href="/">ホームに戻る</a>
+</body>
+</html>
