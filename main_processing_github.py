@@ -567,7 +567,7 @@ def cluster_n(cluster_id):
 #  時系列予測
 # ==========================
 
-window_size = 1000
+window_size = 300
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # --- モデルとスケーラーの読み込み ---
@@ -631,7 +631,7 @@ def on_play(track_features):
                 
                 # 履歴データを処理
                 processed_history = []
-                for row in recent_rows:  # ヘッダーをスキップ
+                for row in recent_rows:  
                     if len(row) > 1:
                         try:
                             timestamp = pd.to_datetime(row[0])
@@ -673,6 +673,10 @@ def predict_next_songs(num_predictions=10):
     """
     global model, history
     
+    # モデルとスケーラーを読み込み（1回だけ）
+    model, scaler = load_model_and_scaler()
+    
+    # 履歴が不足している場合、履歴ファイルから読み込む
     if len(history) < window_size:
         try:
             with open(HISTORY_FILE, 'r', newline='') as file:
@@ -684,7 +688,7 @@ def predict_next_songs(num_predictions=10):
                 
                 # 履歴データを処理
                 processed_history = []
-                for row in recent_rows: 
+                for row in recent_rows:
                     if len(row) > 1:
                         try:
                             timestamp = pd.to_datetime(row[0])
@@ -699,7 +703,6 @@ def predict_next_songs(num_predictions=10):
                             processed_features['day_of_week'] = timestamp.weekday()
                             
                             # 特徴量を正規化
-                            model, scaler = load_model_and_scaler()
                             normalized_features = scaler.transform(processed_features)
                             processed_history.append(normalized_features[0])
                         except (ValueError, TypeError):
@@ -715,9 +718,6 @@ def predict_next_songs(num_predictions=10):
     
     if len(history) < window_size:
         return []
-    
-    # モデルとスケーラーを読み込み
-    model, scaler = load_model_and_scaler()
     
     predictions = []
     history_array = np.array(list(history), dtype=np.float32)
