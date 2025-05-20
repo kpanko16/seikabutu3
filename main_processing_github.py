@@ -123,7 +123,12 @@ dfe['words'] = word_counts
 @app.route('/save_history/<int:song_index>', methods=['POST'])
 def save_history_endpoint(song_index):
     # 履歴を保存
-    save_history(dfe.iloc[song_index].to_list())
+    track_features = dfe.iloc[song_index].to_list()
+    save_history(track_features)
+    
+    # 時系列モデルの微調整
+    on_play(track_features)
+    print("tuning finished")
     return jsonify({'status': 'success'})
 
 #共起行列データ（クラスタリングとは独立して使用）
@@ -325,11 +330,17 @@ def stream():
 def song(song_index):
     # 検索対象ベクトルの取得
     query_vec = vecs_array[song_index].reshape(1, -1)
+    print(f"検索対象の曲: {df.iloc[song_index]['曲名']}")
 
     # 検索 (類似度上位10件を取得、D：類似度スコア、I：インデックス)
     k = 11
     D, I = index_f.search(query_vec, k)
+    print(f"検索結果のスコア: {D[0]}")
+    print(f"検索結果のインデックス: {I[0]}")
+    
     D, I = D[0][1:], I[0][1:]  # 自分自身を除外
+    print(f"除外後のスコア: {D}")
+    print(f"除外後のインデックス: {I}")
 
     # 結果を格納するリスト(<int:song_index>html、song関数下部では結果的にindex)
     results = [(df.iloc[index]['曲名'], df.iloc[index]['artist'], index, 'dummy_audio.wav') for index in I]
@@ -626,7 +637,7 @@ def load_history():
 def on_play(track_features):
     """
     曲が再生されたときに呼び出される関数
-    新しい曲の特徴量でモデルを微調整する
+    最新1000件の履歴データを使用してモデルを微調整する
     
     Args:
         track_features: 再生された曲の特徴量
@@ -641,14 +652,17 @@ def on_play(track_features):
     
     # 特徴量をDataFrameに変換
     features_df = pd.DataFrame([track_features], columns=dfe.columns)
-    # 時間特徴量を追加
-    features_df['hour'] = current_time.hour
-    features_df['day_of_week'] = current_time.weekday()
-    # 前処理を適用
-    processed_features = process_audio_features(features_df, is_display=False)
+    
+    # train_and_evaluate.pyと同じ順序で処理
+    # 1. 特徴量エンジニアリングを適用
+    processed_df = process_audio_features(features_df, is_display=False)
+    
+    # 2. 時間特徴量の追加
+    processed_df['hour'] = current_time.hour
+    processed_df['day_of_week'] = current_time.weekday()
     
     # 特徴量を正規化
-    normalized_features = scaler.transform(processed_features)
+    normalized_features = scaler.transform(processed_df)
     
     # 履歴に追加
     history.append(normalized_features[0])
@@ -656,28 +670,73 @@ def on_play(track_features):
     if len(history) < window_size:
         return
     
-    # 学習モードに切り替え
-    model.train()
-    
-    # 最適化器の設定
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    
-    # 入力データの準備
-    x = torch.tensor([list(history)], device=device, dtype=torch.float32)
-    y = torch.tensor([normalized_features[0]], device=device, dtype=torch.float32)
-    
-    # 勾配の計算と更新
-    optimizer.zero_grad()
-    output = model(x)
-    loss = nn.functional.mse_loss(output, y)
-    loss.backward()
-    optimizer.step()
-    
-    # モデルを保存
-    torch.save(model.state_dict(), 'lstm_model.pth')
-    
-    # 評価モードに戻す
-    model.eval()
+    # 履歴全体を読み込む
+    try:
+        with open(HISTORY_FILE, 'r', newline='') as file:
+            reader = csv.reader(file)
+            history_rows = list(reader)
+            
+            # 最新1000件の履歴データを取得
+            recent_rows = history_rows[-1000:] if len(history_rows) > 1000 else history_rows
+            
+            # 履歴データをDataFrameに変換
+            history_data = []
+            for row in recent_rows[1:]:  # ヘッダーをスキップ
+                if len(row) > 1:
+                    try:
+                        timestamp = pd.to_datetime(row[0])
+                        features = [float(x) for x in row[1:]]
+                        features_df = pd.DataFrame([features], columns=dfe.columns)
+                        
+                        # train_and_evaluate.pyと同じ順序で処理
+                        # 1. 特徴量エンジニアリングを適用
+                        processed_features = process_audio_features(features_df, is_display=False)
+                        
+                        # 2. 時間特徴量の追加
+                        processed_features['hour'] = timestamp.hour
+                        processed_features['day_of_week'] = timestamp.weekday()
+                        
+                        history_data.append(processed_features.values[0])
+                    except (ValueError, TypeError):
+                        continue
+            
+            if len(history_data) < window_size:
+                return
+            
+            # 履歴データを正規化
+            history_data = scaler.transform(history_data)
+            
+            # シーケンスを作成
+            X, y = [], []
+            for i in range(len(history_data) - window_size):
+                X.append(history_data[i:i + window_size])
+                y.append(history_data[i + window_size])
+            
+            X = torch.tensor(X, device=device, dtype=torch.float32)
+            y = torch.tensor(y, device=device, dtype=torch.float32)
+            
+            # 学習モードに切り替え
+            model.train()
+            
+            # 最適化器の設定
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+            
+            # エポック数は少なめに設定（微調整なので）
+            for epoch in range(5):
+                optimizer.zero_grad()
+                output = model(X)
+                loss = nn.functional.mse_loss(output, y)
+                loss.backward()
+                optimizer.step()
+            
+            # モデルを保存
+            torch.save(model.state_dict(), 'lstm_model.pth')
+            
+            # 評価モードに戻す
+            model.eval()
+            
+    except FileNotFoundError:
+        print("履歴ファイルが見つかりません")
 
 # --- 推論: 各ステップ最適曲を1曲ずつ ---
 def predict_next_songs(num_predictions=10):
