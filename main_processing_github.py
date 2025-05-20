@@ -19,39 +19,28 @@
 
 5, 再生履歴データをもとに、次にどのような楽曲を聴きたいかを時系列で追っていくという考えをもとに推測してレコメンドする機能です。
 こちらはまとまった時間で音楽を聴きたいと思った時に使える機能だと考えます。メリットはユーザーがわざわざ選択しなくても自動で
-気分にあった曲を聴き続蹴ることが期待できる点です。今回は時間が足りず、単純に時系列で特徴量を分析するということで終わって
+気分にあった曲を聴き続けることが期待できる点です。今回は時間が足りず、単純に時系列で特徴量を分析するということで終わって
 しまいました。今後の施策として考えられることは、複数のユーザーのデータをロードして、似た傾向のユーザの曲の選定を基準に
 曲そのものをラベルとしてレコメンドする、深層強化学習やGNNによって楽曲とユーザの関係を学習して長期的に反映することなどが
 考えらえます。
 '''
 import csv
-import ctypes
-import os
 import pickle
-import threading
 import faiss
-import librosa
 import numpy as np
 import pandas as pd
-import scipy.signal
-import soundfile as sf
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import whisper
-from flask import Flask
-from flask import request, jsonify, render_template
+from flask import Flask, render_template, request, jsonify, Response, abort
 from scipy.sparse import csr_matrix, hstack
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
-from sudachipy import dictionary
-from sudachipy import tokenizer
-import time
-from train_and_evaluate import LSTM  # LSTMモデルをインポート
+from sudachipy import dictionary, tokenizer
+import os, subprocess, tempfile, threading, queue, time, ctypes, glob, shutil 
 from collections import deque
+import torch, torch.nn as nn
+from train_and_evaluate import LSTM  # LSTMモデルをインポート
 
 app = Flask(__name__)
 
@@ -107,7 +96,7 @@ def save_history(row):
 # 歌詞データCSV
 df = pd.read_csv('comdata.csv') #faiss用
 dfe = df.copy() #cluster用↓これらは固有のものとなるので削除
-#このアーティストはこのような曲調にこのような曲調になりがちみたいな偏見を避けて純粋に局情報に集中させる目的で消去
+#このアーティストはこのような曲調にこのような曲調になりがちみたいな偏見を避けて純粋に曲情報に集中させる目的で消去
 dfe = dfe.drop(columns=['曲名', '歌い出し', 'name', 'album', 'artist', 'popularity'])
 
 # 歌詞の単語数を計算
@@ -191,16 +180,14 @@ def index():
 
     return render_template('indexhightext.html')
 
-# ここから音声認識
+# ==========================
+#  歌詞表示（音声認識）
+# ==========================
 """
 Flask + faster-whisper
 15 秒ずつ分割 → ストリーム認識 → SSE でチャンク送信
 MP3 / WAV / FLAC をサポート
 """
-
-import os, subprocess, tempfile, threading, queue, time, ctypes, glob, shutil, mimetypes
-from flask import Flask, request, jsonify, render_template, Response, abort
-import torch
 
 SEGMENT_SEC   = 15
 MODEL_SIZE    = "small"
@@ -348,9 +335,8 @@ def song(song_index):
 
     return render_template('song.html', song_title=df.iloc[song_index]['曲名'], results=results)
 
-# ==========================
-#  キャッシュとユーティリティ
-# ==========================
+
+# キャッシュとユーティリティ
 _cluster_cache = {
     'means': None,
     'similarities': None,
@@ -378,9 +364,8 @@ def compute_optimal_clusters(data, max_clusters: int = 6) -> int:
     return min(optimal_k, max_clusters)
 
 
-# ------------------------------------------------------------
-#  共通の特徴量エンジニアリング
-# ------------------------------------------------------------
+
+# クラスタリングと時系列共通の特徴量エンジニアリング
 def process_audio_features(df: pd.DataFrame, is_display: bool = False) -> pd.DataFrame:
     """
     音声特徴量の前処理を行う
@@ -405,7 +390,7 @@ def process_audio_features(df: pd.DataFrame, is_display: bool = False) -> pd.Dat
 
 
 # ==========================
-#  クラスタリング本体
+#  クラスタリング
 # ==========================
 def cluster_search():
     """
@@ -578,18 +563,11 @@ def cluster_n(cluster_id):
     )
 
 
-# ────────────────────────────────
-# ここから時系列リアルタイム推薦
-# ────────────────────────────────
-from flask import Flask, render_template, url_for
-from collections import deque
-import torch, torch.nn as nn
-import numpy as np
-import faiss
-import pickle
+# ==========================
+#  時系列予測
+# ==========================
 
-# --- データと設定 ---
-window_size = 10
+window_size = 1000
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # --- モデルとスケーラーの読み込み ---
@@ -608,31 +586,6 @@ def load_model_and_scaler():
 # --- 履歴の管理 ---
 history = deque(maxlen=window_size)
 
-# 履歴ファイルから履歴を読み込む
-def load_history():
-    global history
-    try:
-        with open(HISTORY_FILE, 'r', newline='') as file:
-            reader = csv.reader(file)
-            history_rows = list(reader)
-            if len(history_rows) >= window_size:
-                # 最新のwindow_size件の履歴を読み込む
-                for row in history_rows[-window_size:]:
-                    # タイムスタンプと特徴量を取得
-                    timestamp = pd.to_datetime(row[0])
-                    features = [float(x) for x in row[1:]]
-                    # 特徴量をDataFrameに変換
-                    features_df = pd.DataFrame([features], columns=dfe.columns)
-                    # 時間特徴量を追加
-                    features_df['hour'] = timestamp.hour
-                    features_df['day_of_week'] = timestamp.weekday()
-                    # 前処理を適用
-                    processed_features = process_audio_features(features_df, is_display=False)
-                    history.append(processed_features.values[0])
-    except FileNotFoundError:
-        print("履歴ファイルが見つかりません")
-        history.clear()
-
 # --- 再生時の部分微調整 ---
 def on_play(track_features):
     """
@@ -647,96 +600,65 @@ def on_play(track_features):
     # モデルとスケーラーを読み込み
     model, scaler = load_model_and_scaler()
     
-    # 現在時刻を取得
     current_time = pd.Timestamp.now()
-    
-    # 特徴量をDataFrameに変換
     features_df = pd.DataFrame([track_features], columns=dfe.columns)
     
-    # train_and_evaluate.pyと同じ順序で処理
-    # 1. 特徴量エンジニアリングを適用
+    # 特徴量エンジニアリングを適用
     processed_df = process_audio_features(features_df, is_display=False)
     
-    # 2. 時間特徴量の追加
+    # 時間特徴量の追加
     processed_df['hour'] = current_time.hour
     processed_df['day_of_week'] = current_time.weekday()
     
     # 特徴量を正規化
     normalized_features = scaler.transform(processed_df)
     
-    # 履歴に追加
+    # 前処理済み履歴に追加
     history.append(normalized_features[0])
     
     if len(history) < window_size:
         return
     
-    # 履歴全体を読み込む
-    try:
-        with open(HISTORY_FILE, 'r', newline='') as file:
-            reader = csv.reader(file)
-            history_rows = list(reader)
-            
-            # 最新1000件の履歴データを取得
-            recent_rows = history_rows[-1000:] if len(history_rows) > 1000 else history_rows
-            
-            # 履歴データをDataFrameに変換
-            history_data = []
-            for row in recent_rows[1:]:  # ヘッダーをスキップ
-                if len(row) > 1:
-                    try:
-                        timestamp = pd.to_datetime(row[0])
-                        features = [float(x) for x in row[1:]]
-                        features_df = pd.DataFrame([features], columns=dfe.columns)
-                        
-                        # train_and_evaluate.pyと同じ順序で処理
-                        # 1. 特徴量エンジニアリングを適用
-                        processed_features = process_audio_features(features_df, is_display=False)
-                        
-                        # 2. 時間特徴量の追加
-                        processed_features['hour'] = timestamp.hour
-                        processed_features['day_of_week'] = timestamp.weekday()
-                        
-                        history_data.append(processed_features.values[0])
-                    except (ValueError, TypeError):
-                        continue
-            
-            if len(history_data) < window_size:
-                return
-            
-            # 履歴データを正規化
-            history_data = scaler.transform(history_data)
-            
-            # シーケンスを作成
-            X, y = [], []
-            for i in range(len(history_data) - window_size):
-                X.append(history_data[i:i + window_size])
-                y.append(history_data[i + window_size])
-            
-            X = torch.tensor(X, device=device, dtype=torch.float32)
-            y = torch.tensor(y, device=device, dtype=torch.float32)
-            
-            # 学習モードに切り替え
-            model.train()
-            
-            # 最適化器の設定
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-            
-            # エポック数は少なめに設定（微調整なので）
-            for epoch in range(5):
-                optimizer.zero_grad()
-                output = model(X)
-                loss = nn.functional.mse_loss(output, y)
-                loss.backward()
-                optimizer.step()
-            
-            # モデルを保存
-            torch.save(model.state_dict(), 'lstm_model.pth')
-            
-            # 評価モードに戻す
-            model.eval()
-            
-    except FileNotFoundError:
-        print("履歴ファイルが見つかりません")
+    # 履歴が不足している場合、履歴ファイルから読み込む
+    if len(history) < window_size:
+        try:
+            with open(HISTORY_FILE, 'r', newline='') as file:
+                reader = csv.reader(file)
+                history_rows = list(reader)
+                
+                # 最新の履歴データを取得（window_size分）
+                recent_rows = history_rows[-window_size:] if len(history_rows) > window_size else history_rows
+                
+                # 履歴データを処理
+                processed_history = []
+                for row in recent_rows:  # ヘッダーをスキップ
+                    if len(row) > 1:
+                        try:
+                            timestamp = pd.to_datetime(row[0])
+                            features = [float(x) for x in row[1:]]
+                            features_df = pd.DataFrame([features], columns=dfe.columns)
+                            
+                            # 特徴量エンジニアリングを適用
+                            processed_features = process_audio_features(features_df, is_display=False)
+                            
+                            # 時間特徴量の追加
+                            processed_features['hour'] = timestamp.hour
+                            processed_features['day_of_week'] = timestamp.weekday()
+                            
+                            # 特徴量を正規化
+                            model, scaler = load_model_and_scaler()
+                            normalized_features = scaler.transform(processed_features)
+                            processed_history.append(normalized_features[0])
+                        except (ValueError, TypeError):
+                            continue
+                
+                # 処理済みの履歴をhistoryに代入
+                history.clear()  # 既存の履歴をクリア
+                for feature in processed_history:
+                    history.append(feature)
+                
+        except FileNotFoundError:
+            print("履歴ファイルが見つかりません")
 
 # --- 推論: 各ステップ最適曲を1曲ずつ ---
 def predict_next_songs(num_predictions=10):
@@ -747,28 +669,64 @@ def predict_next_songs(num_predictions=10):
         num_predictions: 予測する曲の数
     
     Returns:
-        予測された曲の特徴量のリスト（時間特徴量を含む）と比較用特徴量（時間特徴量を除外）
+        予測された曲の特徴量のリスト（比較用特徴量（時間特徴量を除外）
     """
     global model, history
     
     if len(history) < window_size:
-        return [], []
+        try:
+            with open(HISTORY_FILE, 'r', newline='') as file:
+                reader = csv.reader(file)
+                history_rows = list(reader)
+                
+                # 最新の履歴データを取得（window_size分）
+                recent_rows = history_rows[-window_size:] if len(history_rows) > window_size else history_rows
+                
+                # 履歴データを処理
+                processed_history = []
+                for row in recent_rows: 
+                    if len(row) > 1:
+                        try:
+                            timestamp = pd.to_datetime(row[0])
+                            features = [float(x) for x in row[1:]]
+                            features_df = pd.DataFrame([features], columns=dfe.columns)
+                            
+                            # 特徴量エンジニアリングを適用
+                            processed_features = process_audio_features(features_df, is_display=False)
+                            
+                            # 時間特徴量の追加
+                            processed_features['hour'] = timestamp.hour
+                            processed_features['day_of_week'] = timestamp.weekday()
+                            
+                            # 特徴量を正規化
+                            model, scaler = load_model_and_scaler()
+                            normalized_features = scaler.transform(processed_features)
+                            processed_history.append(normalized_features[0])
+                        except (ValueError, TypeError):
+                            continue
+                
+                # 処理済みの履歴をhistoryに代入
+                history.clear()  # 既存の履歴をクリア
+                for feature in processed_history:
+                    history.append(feature)
+                
+        except FileNotFoundError:
+            print("履歴ファイルが見つかりません")
+    
+    if len(history) < window_size:
+        return []
     
     # モデルとスケーラーを読み込み
     model, scaler = load_model_and_scaler()
     
     predictions = []
-    # 履歴をnumpy配列に変換してからfloat32型のテンソルに変換
     history_array = np.array(list(history), dtype=np.float32)
     current_sequence = torch.tensor(history_array, device=device).unsqueeze(0)
     
     with torch.no_grad():
         for _ in range(num_predictions):
-            # 予測
             pred = model(current_sequence)
             predictions.append(pred[0].cpu().numpy())
-            
-            # シーケンスを更新
             current_sequence = torch.cat([
                 current_sequence[:, 1:],
                 pred.unsqueeze(1)
@@ -782,25 +740,17 @@ def predict_next_songs(num_predictions=10):
     pred_df['hour'] = current_time.hour
     pred_df['day_of_week'] = current_time.weekday()
     
-    # 予測用の特徴量（時間特徴量を含む）
-    prediction_features = pred_df.values
-    
-    # 曲データベースとの比較用の特徴量（時間特徴量を除外）
+    # cos類似度での比較用の特徴量（時間特徴量を除外）
     comparison_features = pred_df.drop(columns=['hour', 'day_of_week']).values
     
-    return prediction_features, comparison_features
+    return comparison_features
 
-# --- 初期化 ---
 model, scaler = load_model_and_scaler()
 
 @app.route('/timeseries')
-def timeseries():
-    # 履歴が不足している場合は履歴を再読み込み
-    if len(history) < window_size:
-        load_history()
-    
-    pred_features, comp_features = predict_next_songs(window_size)
-    if len(pred_features) == 0:
+def timeseries():   
+    comp_features = predict_next_songs(10)
+    if len(comp_features) == 0:
         return render_template('timeseries.html', message='履歴が不足しています')
     
     # dfeの値を前処理
