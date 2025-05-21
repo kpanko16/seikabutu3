@@ -40,7 +40,7 @@ from sudachipy import dictionary, tokenizer
 import os, subprocess, tempfile, threading, queue, time, ctypes, glob, shutil 
 from collections import deque
 import torch, torch.nn as nn
-from train_and_evaluate import LSTM  # LSTMモデルをインポート
+from train_and_evaluate import LSTM  
 
 app = Flask(__name__)
 
@@ -120,6 +120,9 @@ def save_history_endpoint(song_index):
     print("tuning finished")
     return jsonify({'status': 'success'})
 
+# ==========================
+#  TFIDFによる重要語重要語検索
+# ==========================
 #共起行列データ（クラスタリングとは独立して使用）
 dfc = pd.read_csv('co_occurrence_matrix_lylics.csv', header=None, names=['Word1', 'Word2', 'Count'])
 dfc['Count'] = pd.to_numeric(dfc['Count'], errors='coerce')
@@ -311,7 +314,9 @@ def stream():
                 keep = time.time()
     return Response(gen(), mimetype="text/event-stream")
 
-
+# ==========================
+#  歌詞類似度
+# ==========================
 @app.route('/song/<int:song_index>', methods=['GET'])
 # song.htmlのindex→song関数のsong_index→（結果的に）song関数のindex
 def song(song_index):
@@ -368,14 +373,10 @@ def compute_optimal_clusters(data, max_clusters: int = 6) -> int:
 # クラスタリングと時系列共通の特徴量エンジニアリング
 def process_audio_features(df: pd.DataFrame, is_display: bool = False) -> pd.DataFrame:
     """
-    音声特徴量の前処理を行う
-    
-    Args:
-        df: 入力DataFrame
-        is_display: 表示用の場合はTrue（元の列を保持）
-    
-    Returns:
-        処理済みのDataFrame
+    音声特徴量のクラスタリングと時系列の共通の前処理を行う
+    df: 入力DataFrame
+    is_display: 表示用の場合はTrue（元の列を保持）
+    Returns:処理済みのDataFrame
     """
     processed_df = df.copy()
     
@@ -394,15 +395,15 @@ def process_audio_features(df: pd.DataFrame, is_display: bool = False) -> pd.Dat
 # ==========================
 def cluster_search():
     """
-    - 履歴データを "計算用" と "表示用" に複製
-    - 計算用 DF は追加特徴量を入れ、key/loudness を削ったうえで
+    履歴データを "計算用" と "表示用" に複製
+    計算用 DF は追加特徴量を入れ、key/loudness を削ったうえで
       StandardScaler → 相関削除 → PCA → k-means
-    - 表示用 DF は列をいじらず、計算で得た cluster ラベルだけ付与
+    表示用 DF は列をいじらず、計算で得た cluster ラベルだけ付与
     """
     global _cluster_cache
     now = time.time()
 
-    # ---------- キャッシュ確認 ----------
+    # キャッシュ確認
     if (
         _cluster_cache.get("means") is not None
         and _cluster_cache.get("similarities") is not None
@@ -418,7 +419,6 @@ def cluster_search():
 
     print("=== cluster_search開始 ===")
 
-    # ---------- 履歴読み込み ----------
     try:
         with open(HISTORY_FILE, newline="", encoding="utf-8") as fh:
             history_rows = list(csv.reader(fh))
@@ -430,7 +430,7 @@ def cluster_search():
         print("履歴データが不足しています")
         return pd.DataFrame(), [], []
 
-    # ---------- DataFrame 基本形 ----------
+    # データフレーム作成
     numeric_rows = [
         [float(x) if x.strip() else np.nan for x in row[1:]]
         for row in history_rows
@@ -445,22 +445,21 @@ def cluster_search():
         print("クラスタリングに十分なデータがありません")
         return pd.DataFrame(), [], []
 
-    # ---------- ① 計算用 / ② 表示用 に複製 ----------
+    # 計算用と表示用に複製
     calc_df = process_audio_features(base_df, is_display=False)
     disp_df = process_audio_features(base_df, is_display=True)
 
-    # ----- 楽曲カタログ側も計算仕様を合わせる -----
+    #　元の履歴データ側計算仕様を合わせる
     dfe_calc = process_audio_features(dfe, is_display=False)
 
-    # ---------- スケーリング ----------
-    scaler = StandardScaler()
+    # スケーリング 
     scaled_calc = pd.DataFrame(
         scaler.fit_transform(calc_df),
         columns=calc_df.columns,
         index=calc_df.index,
     )
 
-    # ---------- 高相関列除去 ----------
+    # 高相関列除去 
     corr = scaled_calc.corr()
     high_corr, remove_cols = [], set()
     for i in range(len(corr.columns)):
@@ -474,7 +473,7 @@ def cluster_search():
     keep_cols = [c for c in scaled_calc.columns if c not in remove_cols]
     reduced_scaled = scaled_calc[keep_cols]
 
-    # ---------- PCA → k-means ----------
+    # PCA → k-means 
     pca = PCA(n_components=0.95, random_state=0)
     reduced_feat = pca.fit_transform(reduced_scaled)
     k_opt = compute_optimal_clusters(reduced_feat)
@@ -482,7 +481,7 @@ def cluster_search():
     clusters = kmeans.fit_predict(reduced_feat)
     print(f"PCA {reduced_feat.shape} → k-means (k={k_opt}) 完了")
 
-    # ---------- クラスタ平均 ----------
+    # クラスタ平均 
     # 計算用（追加列あり）
     cluster_means_calc = (
         calc_df.assign(cluster=clusters)
@@ -495,14 +494,16 @@ def cluster_search():
     )
     cluster_means_disp.index.name = None
 
-    # 'length' を秒に変換（表示用だけ）
+    # 'length' を秒に変換
     if "length" in cluster_means_disp.columns:
         cluster_means_disp["length"] = cluster_means_disp["length"] / 1000
 
-    # ---------- 類似曲 (追加特徴量を含む calc 側で計算) ----------
+    # 類似曲 (追加特徴量を含む calc 側で計算) 
     cluster_similarities = []
     dfe_feat_mat = dfe_calc[keep_cols].values
-    for centroid in cluster_means_calc[keep_cols].values:   # ★ ここを calc に
+    for centroid in cluster_means_calc[keep_cols].values: 
+        # dfe_feat_matは2次元なので、centroidも2次元(1, n_features)に合わせる必要がある
+        # flatten()で(n_songs,)の1次元配列に変換はいらないかも
         sims = cosine_similarity(dfe_feat_mat, centroid.reshape(1, -1)).flatten()
         top_idx = np.argsort(sims)[-10:][::-1]
         cluster_similarities.append(
@@ -512,7 +513,6 @@ def cluster_search():
             ]
         )
 
-    # ---------- キャッシュ ----------
     _cluster_cache.update(
         {
             "means": cluster_means_disp,          # ← 表示用 DF を保存
@@ -583,17 +583,15 @@ def load_model_and_scaler():
     
     return model, scaler
 
-# --- 履歴の管理 ---
+# 履歴の管理 
 history = deque(maxlen=window_size)
 
-# --- 再生時の部分微調整 ---
+# 再生時の部分微調整
 def on_play(track_features):
     """
     曲が再生されたときに呼び出される関数
     最新1000件の履歴データを使用してモデルを微調整する
-    
-    Args:
-        track_features: 再生された曲の特徴量
+    track_features: 再生された曲の特徴量
     """
     global model, history
     
@@ -660,16 +658,11 @@ def on_play(track_features):
         except FileNotFoundError:
             print("履歴ファイルが見つかりません")
 
-# --- 推論: 各ステップ最適曲を1曲ずつ ---
+# 各ステップ最適曲を1曲ずつ推論
 def predict_next_songs(num_predictions=10):
     """
-    次のnum_predictions曲を予測する
-    
-    Args:
-        num_predictions: 予測する曲の数
-    
-    Returns:
-        予測された曲の特徴量のリスト（比較用特徴量（時間特徴量を除外）
+    num_predictions: 予測する曲の数
+    予測された曲の特徴量のリスト（比較用特徴量（時間特徴量を除外）
     """
     global model, history
     
